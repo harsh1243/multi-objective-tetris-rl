@@ -1,0 +1,7 @@
+# Needed for training, evaluation and plotting (NOT for the Streamlit demo).
+# Kept out of requirements.txt on purpose: Streamlit Cloud installs requirements.txt,
+# and torch would make the deployed demo slow to build for no reason.
+numpy
+torch
+pandas
+matplotlib
