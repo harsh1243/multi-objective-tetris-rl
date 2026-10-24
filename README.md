@@ -25,29 +25,49 @@ R = w1*r1 - w2*r2 - w3*r3 + w4*r4        (baseline: R = r1)
 ```
 
 The weights w1..w4 are **fixed hyperparameters** chosen before each run. PPO trains the
-neural network, not these weights. The experiment is an ablation over the weights, with several
+neural networks, not these weights. The experiment is an ablation over the weights, with several
 random seeds each. We measure what changes; we do not assume the shaped reward wins.
 
 ## Problem formulation
 
-- **State:** binary board grid (20 x 10), a feature vector (column heights, aggregate height,
+- **State:** binary board grid (20 x 10), board features (column heights, aggregate height,
   holes, bumpiness), and the current piece type.
 - **Action:** a `(rotation, column)` placement of the current piece, encoded as
-  `rotation * 10 + column` (40 slots). Illegal placements are removed by an action mask.
+  `rotation * 10 + column` (40 slots). Illegal placements are removed by an action mask. A
+  placement is legal if the piece can be dropped straight down from above the board.
 - **Reward:** the weighted reward above, computed from the board before and after each move.
-- **Episode:** ends when the next piece has no legal placement. Next pieces are drawn at random.
-- **Algorithm:** PPO with a categorical policy, GAE advantages, and a shared conv encoder for
-  the board plus a small MLP for the features.
+- **Episode:** ends when the next piece has no legal placement, or after 500 pieces during
+  training (time limit; the critic bootstraps through it). Next pieces are drawn at random.
+- **Algorithm:** PPO with a categorical policy over the placements, GAE advantages, and
+  action masking.
+
+## Network (afterstate actor-critic)
+
+The first version of this project used an actor that read the current board and produced 40
+separate output scores. It learned slowly (about 55 pieces survived after 2 million
+placements). The final design follows the afterstate-evaluating actor used by recent PPO
+Tetris agents:
+
+- **Actor:** for every legal placement, compute the features of the board that would result
+  (after placing the piece and clearing lines), and score it with ONE small MLP shared by all
+  placements. The scores of illegal placements are masked, and a softmax over the scores gives
+  the policy. The features are the abstract's column heights, aggregate height, holes and
+  bumpiness, plus standard Dellacherie-Thiery features (lines cleared, landing height, eroded
+  cells, row and column transitions, wells, hole depth, rows with holes), see `features.py`.
+- **Critic:** a small conv encoder on the current board, an MLP on the 13 board features and a
+  piece embedding, giving V(s).
+- Actor and critic are separate networks; their gradients are clipped separately.
 
 ## Files
 
 | File | What it does |
 |------|--------------|
 | `reward.py` | Board features (heights, holes, bumpiness) and the four reward terms |
-| `tetris_env.py` | Placement-based Tetris environment with action masking (`reset` / `step`) |
-| `network.py` | Actor-critic network: conv board encoder + feature MLP + piece embedding, masked policy |
+| `features.py` | Vectorized afterstate features for all candidate placements |
+| `tetris_env.py` | Placement-based Tetris environment with action masking and afterstate features |
+| `network.py` | Afterstate actor + conv critic |
 | `ppo.py` | PPO training: rollout buffer, GAE, clipped updates, CSV logging, checkpoints |
-| `run_experiments.py` | Launches all runs (reward setting x seed), in parallel if wanted; skips finished runs, resumes interrupted ones |
+| `run_experiments.py` | Launches all runs (reward setting x seed); skips finished runs, resumes interrupted ones |
 | `evaluate.py` | Every agent plays the same fixed games; neutral metrics; random and greedy reference agents; checkpoint sweep |
 | `plot.py` | Training curves, trade-off plot, final comparison, checkpoint progress |
 | `tetris_demo.py` | Streamlit live demo (falling pieces, line-clear animation, reward panel) |
@@ -61,16 +81,14 @@ pip install -r requirements-train.txt     # training, evaluation, plots
 pip install streamlit                      # only for the demo
 ```
 
-Python 3.10 or newer. `streamlit` 1.37 or newer for the demo. Do not put `torch` in
-`requirements.txt` (Streamlit Cloud installs that file); that is why training dependencies
-live in `requirements-train.txt`.
+Python 3.10 or newer. Do not put `torch` in `requirements.txt` (Streamlit Cloud installs that
+file); that is why training dependencies live in `requirements-train.txt`.
 
 ## Quick checks
 
-Each module has a built-in self-test:
-
 ```bash
 python reward.py
+python features.py
 python tetris_env.py
 python network.py
 python ppo.py --self-test
@@ -80,34 +98,43 @@ streamlit run tetris_demo.py
 ## Running the experiments
 
 ```bash
-# 1) Pilot: one baseline and one multi-objective run. Check steps/s and that curves improve.
-python run_experiments.py --settings baseline,multi --seeds 0 --total-steps 2000000 --device cuda
+# 1) First run: the multi-objective agent, seed 0
+python run_experiments.py --settings multi --seeds 0 --total-steps 2000000 --device cuda
 
-# 2) Full ablation: all settings, 3 seeds, a few runs at once (about one per CPU core)
+# 2) The baseline (lines only), seed 0
+python run_experiments.py --settings baseline --seeds 0 --total-steps 2000000 --device cuda
+
+# 3) Full set: all settings, 3 seeds (finished runs are skipped)
 python run_experiments.py --settings all --seeds 0,1,2 --total-steps 2000000 --parallel 3
 
-# 3) Evaluate all trained agents on the same fixed games (+ checkpoint progress)
+# 4) Evaluate all trained agents on the same fixed games (+ checkpoint progress)
 python evaluate.py --sweep
 
-# 4) Draw the graphs into figures/
+# 5) Draw the graphs into figures/
 python plot.py
 ```
 
+- The network is tiny, so `--device cpu` can be as fast as or faster than `--device cuda`.
+  Time 20,000 steps both ways and pick the faster one.
 - `python run_experiments.py --list` shows the reward settings (edit `SETTINGS` in that file).
-- Re-running the same command is safe: finished runs are skipped, interrupted runs resume.
 - Every run lives in `runs/<setting>_s<seed>/` with `config.json`, `metrics.csv`, `train.log`
   and `checkpoints/`.
 - Checkpoints are saved at PPO iterations 1, 10, 50 and then every 100th (one iteration is
-  2048 placements), plus `latest.pt` and `final.pt`. Load one with:
+  2048 placements), plus `latest.pt` and `final.pt`:
 
 ```python
 from ppo import load_checkpoint
 model, meta = load_checkpoint("runs/multi_s0/checkpoints/iter_000100.pt")
 ```
 
+Checkpoints from the first (slot-based) design cannot be loaded; `load_checkpoint` says so
+with a clear error. Keep old `runs/` folders out of the new `runs/` directory.
+
 Use the same training budget and number of seeds for every setting. Evaluation uses seeds
 that training never sees, and every metric is counted from the game itself (lines, pieces
-survived, holes, height, bumpiness), never from an agent's own reward.
+survived, holes, height, bumpiness), never from an agent's own reward. Evaluation caps games at
+1000 pieces (`--max-pieces`); well-trained agents reach the cap, so also compare lines per game
+and board quality, and raise the cap if survival saturates.
 
 ## Graphs
 
@@ -122,24 +149,22 @@ survived, holes, height, bumpiness), never from an agent's own reward.
 | fig7 policy and value loss | training logs |
 | fig8 agent quality across saved checkpoints | evaluate.py --sweep |
 
-## Design notes and open decisions
+## Design notes
 
 - The environment is written directly in NumPy for speed and testability instead of wrapping
   `tetris-gymnasium` (named in the abstract). Team decision pending.
 - Board height is not stated in the abstract. We use the standard 20 rows.
 - r2 and r3 are measured as the change caused by the move (after line clearing minus before).
   r3 is the change in bumpiness plus the change in maximum height.
-- Reward terms are not normalized to a common scale and the weights in `SETTINGS` are starting
-  points, not tuned values.
-- No episode-length cap during training by default. Evaluation caps games at 500 pieces.
-- Early test runs (250k placements, single seed) improved over random play but flattened at
-  roughly 40 to 45 pieces; longer runs are needed to know where training saturates. Run the
-  pilot first and choose the training budget from its curves.
+- The weights in `SETTINGS` are starting points, not tuned values.
+- Because the actor sees the same board features that define r2 and r3, the lines-only baseline
+  can also learn to avoid holes through the value signal. The gap between baseline and
+  multi-objective agents may therefore be smaller than expected; that is a valid result.
 
 ## Current status
 
-Environment, reward, network, PPO, launcher, evaluation, plotting and the demo are written and
-self-tested. The full experiments have not been run yet, so there are no results.
+Environment, reward, features, network, PPO, launcher, evaluation, plotting and the demo are
+written and self-tested. The full experiments have not been run yet, so there are no results.
 
 ## References
 
