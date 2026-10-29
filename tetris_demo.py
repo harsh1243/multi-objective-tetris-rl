@@ -14,6 +14,7 @@ Agents (pick in the sidebar):
   - Multi-objective PPO   the trained agent (models/multi_s0_final.pt)
   - Baseline PPO          lines-only agent; appears once its checkpoint is in models/
   - Greedy / Random       simple reference agents (these use the reward weights from the sidebar)
+  - Compare all agents    every agent plays at once in a 2x2 grid, all fed the exact same piece sequence
 Trained agents play with the reward weights they were trained with (read from the checkpoint).
 """
 
@@ -35,6 +36,8 @@ MODELS = {
     "Baseline PPO (trained)": "models/baseline_s0_final.pt",
 }
 SIMPLE_AGENTS = ["Greedy (best immediate reward)", "Random"]
+COMPARE = "Compare all agents (same pieces, side by side)"  # 5th sidebar option: all agents in a 2x2 grid
+AGENT_ACCENT = {"Multi-objective PPO": "#6d8bff", "Baseline PPO": "#ffc15e", "Greedy": "#8be28b", "Random": "#ff6b81"}
 
 
 def available_models() -> dict:
@@ -304,6 +307,268 @@ def render_scene(env, grid, history, last, phase="fall", banner=None, **board_kw
     return f'<div class="viz-wrap">{board}{panel}</div>'
 
 
+
+# ----------------------------------------------------------------------------
+# Compare mode: all agents play side by side on the SAME piece sequence
+# ----------------------------------------------------------------------------
+# Why the pieces are identical: the env draws every piece with `rng.integers(7)` and that draw does not
+# depend on the board or on the action. So envs created with the same seed see the same pieces forever.
+def _cmp_css() -> str:
+    colors = "".join(
+        f".cc.c{k},.cm.c{k}{{background:linear-gradient(145deg,{a},{b});"
+        f"box-shadow:inset 1px 1px 2px rgba(255,255,255,.4),inset -2px -2px 3px rgba(0,0,0,.3);}}"
+        for k, (a, b) in PIECE_COLORS.items()
+    )
+    return (
+        "<style>"
+        ".block-container{max-width:100% !important;padding-left:1rem !important;padding-right:1rem !important;}"
+        ".viz-title,.viz-sub{display:none !important;}"
+        # two boards stacked vertically must fit in the window height
+        ":root{--ccell:max(9px,min(24px,calc((100vh - 255px) / 40)));--cmini:calc(var(--ccell) * 0.5);}"
+        ".cmp-bar{display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap;"
+        "background:#10142a;border:1px solid #262d57;border-radius:12px;padding:5px 12px;margin-bottom:8px;"
+        "color:#7c86b8;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;}"
+        ".cmp-bar b{color:#f2f4ff;font-size:.95rem;letter-spacing:0;}"
+        ".chip{display:grid;gap:0;}"
+        ".cm{width:var(--cmini);height:var(--cmini);}"
+        ".cmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}"
+        ".cmp-q{display:flex;gap:12px;justify-content:center;align-items:flex-start;background:#0d1124;"
+        "border:1px solid #262d57;border-radius:14px;padding:8px 10px;}"
+        ".cmp-q.lead{border-color:#ffd166;box-shadow:0 0 18px rgba(255,209,102,.25);}"
+        ".cmp-name{font-weight:800;font-size:.95rem;margin-bottom:4px;white-space:nowrap;}"
+        ".cb{position:relative;display:grid;grid-template-columns:repeat(10,var(--ccell));padding:5px;"
+        "background:#0a0d18;border:2px solid #2b3260;border-radius:10px;}"
+        ".cc{width:var(--ccell);height:var(--ccell);border-radius:3px;background:#141829;"
+        "box-shadow:inset 0 0 0 1px #1d2340;}"
+        + colors +
+        ".cc.cf{background:#fff;box-shadow:0 0 10px #fff,0 0 20px #9fb4ff;}"
+        ".cbanner{position:absolute;top:42%;left:0;right:0;text-align:center;font-size:.95rem;font-weight:800;"
+        "color:#fff;background:rgba(10,13,24,.85);padding:8px 0;letter-spacing:1px;}"
+        ".cmp-side{display:grid;grid-template-columns:1fr 1fr;gap:6px;width:150px;align-content:start;}"
+        ".cmp-side .card{padding:5px 8px;}"
+        ".cmp-side .card-value{font-size:1.05rem;}"
+        ".cmp-side .card-label{font-size:.6rem;}"
+        ".cmp-side .card-small{font-size:.72rem;}"
+        "</style>"
+    )
+
+
+def short_name(label: str) -> str:
+    """'Multi-objective PPO (trained)' -> 'Multi-objective PPO', 'Greedy (best immediate reward)' -> 'Greedy'."""
+    return label.split(" (")[0]
+
+
+def build_compare_specs(models: dict, load) -> list:
+    """One spec per agent: trained checkpoints first, then Greedy and Random (default reward weights)."""
+    specs = []
+    for label, path in models.items():
+        model, w, _ = load(path)
+        specs.append({"label": short_name(label), "kind": "trained", "model": model, "weights": RewardWeights(*w)})
+    for label in SIMPLE_AGENTS:
+        kind = "greedy" if label.startswith("Greedy") else "random"
+        specs.append({"label": short_name(label), "kind": kind, "model": None, "weights": RewardWeights()})
+    return specs
+
+
+def new_compare_round(specs: list, max_pieces: int, seed=None):
+    """Fresh games for every agent. Same seed -> same piece sequence for all of them."""
+    if seed is None:
+        seed = int(np.random.SeedSequence().entropy % (2**31))
+    slots = []
+    for sp in specs:
+        env = TetrisPlacementEnv(weights=sp["weights"], max_pieces=max_pieces or None, seed=seed)
+        slots.append({"spec": sp, "env": env, "obs": env.reset(), "last": None, "done": False, "died": False})
+    return slots, seed
+
+
+def choose_action(spec, env, obs, deterministic: bool, rng) -> int:
+    if spec["kind"] == "trained":
+        return trained_action(spec["model"], obs[0], obs[1], deterministic)
+    if spec["kind"] == "greedy":
+        return greedy_action(env, env.weights, rng)
+    return int(rng.choice(np.flatnonzero(env.mask)))
+
+
+def compare_step(slots, show, delay, deterministic, rng):
+    """
+    Every agent still alive places ONE piece (the same piece for all of them), animated in lock-step.
+    show(views, header) draws one frame; views[i] = dict(grid, overlay, flash_rows, flash_on, blank_rows).
+    """
+    live = [(i, s) for i, s in enumerate(slots) if not s["done"]]
+    if not live:
+        return
+    ref = live[0][1]["env"]
+    header = {"num": ref.pieces_placed + 1, "cur": ref.piece, "nxt": peek_next(ref)}
+
+    def base_views():
+        return [dict(grid=s["env"].grid()) for s in slots]
+
+    # 1) each live agent decides where the (shared) piece goes
+    plans = []
+    for i, s in live:
+        env = s["env"]
+        a = choose_action(s["spec"], env, s["obs"], deterministic, rng)
+        rot, col = divmod(a, env.cols)
+        locked, _, lines, land_row, full_rows = simulate_placement(env, a)
+        n = min(land_row + 1, 6)
+        rows = sorted(set(np.linspace(0, land_row, n).astype(int).tolist()))
+        plans.append(dict(i=i, slot=s, action=a, shape=ROTATIONS[env.piece][rot], col=col, pid=env.piece + 1,
+                          before=env.grid(), locked=locked, lines=lines, full_rows=full_rows, rows=rows))
+
+    # 2) the piece falls on every board at the same time
+    for k in range(max(len(p["rows"]) for p in plans)):
+        views = base_views()
+        for p in plans:
+            r = p["rows"][min(k, len(p["rows"]) - 1)]
+            views[p["i"]] = dict(grid=p["before"], overlay=(p["shape"], r, p["col"], p["pid"]))
+        show(views, header)
+        time.sleep(delay)
+
+    # 3) apply the moves in the real envs
+    for p in plans:
+        s = p["slot"]
+        state, reward, done, info, mask = s["env"].step(p["action"])
+        s["obs"] = (state, mask)
+        s["last"] = {"piece": info["piece"], "components": info["reward_components"], "total": reward}
+        if done:
+            s["done"] = True
+            s["died"] = bool(info.get("terminated", True))
+
+    # 4) line-clear flash on the boards that cleared something
+    clearing = [p for p in plans if p["lines"]]
+    if clearing:
+        for k in range(4):
+            views = base_views()
+            for p in clearing:
+                if k < 3:
+                    views[p["i"]] = dict(grid=p["locked"], flash_rows=p["full_rows"], flash_on=(k % 2 == 0))
+                else:
+                    views[p["i"]] = dict(grid=p["locked"], blank_rows=p["full_rows"])
+            show(views, header)
+            time.sleep(delay * 1.5)
+    show(base_views(), header)
+    time.sleep(delay)
+
+
+def _cmp_cell(v: int, flash: bool = False) -> str:
+    if flash:
+        return '<div class="cc cf"></div>'
+    return '<div class="cc"></div>' if v == 0 else f'<div class="cc c{v}"></div>'
+
+
+def _cmp_board(grid, overlay=None, flash_rows=(), flash_on=True, blank_rows=(), banner=None) -> str:
+    g = np.array(grid, dtype=int)
+    if overlay is not None:
+        shape, row, col, pid = overlay
+        h, w = shape.shape
+        g[row : row + h, col : col + w][shape > 0] = pid
+    for r in blank_rows:
+        g[r, :] = 0
+    flash_set = set(int(r) for r in flash_rows) if flash_on else set()
+    cells = "".join(
+        _cmp_cell(int(g[r, c]), flash=(r in flash_set and g[r, c] > 0))
+        for r in range(g.shape[0])
+        for c in range(g.shape[1])
+    )
+    ban = f'<div class="cbanner">{banner}</div>' if banner else ""
+    return f'<div class="cb">{cells}{ban}</div>'
+
+
+def _chip(piece_idx: int) -> str:
+    shape = ROTATIONS[piece_idx][0]
+    h, w = shape.shape
+    cells = "".join(
+        f'<div class="cm c{piece_idx + 1}"></div>' if shape[r, c] else '<div class="cm"></div>'
+        for r in range(h)
+        for c in range(w)
+    )
+    return f'<div class="chip" style="grid-template-columns:repeat({w},var(--cmini))">{cells}</div>'
+
+
+def render_compare(slots, views, header, history) -> str:
+    lines = [s["env"].total_lines for s in slots]
+    top = max(lines)
+    leader = lines.index(top) if top > 0 and lines.count(top) == 1 else -1  # gold border = strictly ahead
+    quads = []
+    for i, (s, v) in enumerate(zip(slots, views)):
+        env, name = s["env"], s["spec"]["label"]
+        f = board_features(env.board)
+        banner = None
+        if s["done"] and not v.get("flash_rows") and not v.get("blank_rows"):
+            banner = "GAME OVER" if s["died"] else "LIMIT REACHED"
+        board = _cmp_board(banner=banner, **v)
+        accent = AGENT_ACCENT.get(name, "#dfe3ff")
+        star = " ★" if i == leader else ""
+        hist = history.get(name, [])
+        if hist:
+            hs = f"{len(hist)} rounds · avg {np.mean([h[0] for h in hist]):.0f} pcs · {np.mean([h[1] for h in hist]):.1f} lines"
+        else:
+            hs = "no finished rounds yet"
+        side = (
+            '<div class="cmp-side">'
+            + _stat("Lines", env.total_lines, "span2")
+            + _stat("Pieces", env.pieces_placed)
+            + _stat("Reward", f"{env.total_reward:.1f}")
+            + _stat("Holes", f["holes"])
+            + _stat("Height", f["max_height"])
+            + f'<div class="card span2"><div class="card-label">History</div><div class="card-small">{hs}</div></div>'
+            + "</div>"
+        )
+        quads.append(
+            f'<div class="cmp-q{" lead" if i == leader else ""}"><div>'
+            f'<div class="cmp-name" style="color:{accent}">{name}{star}</div>{board}</div>{side}</div>'
+        )
+    bar = (
+        f'<div class="cmp-bar"><span>Piece <b>#{header["num"]}</b></span>'
+        f'<span>Now</span>{_chip(header["cur"])}<span>Next</span>{_chip(header["nxt"])}'
+        f'<span>identical pieces for every agent</span></div>'
+    )
+    return f'{bar}<div class="cmp-grid">{"".join(quads)}</div>'
+
+
+def run_compare(st, models: dict, max_pieces: int, speed: int, deterministic: bool, restart: bool):
+    st.markdown(_cmp_css(), unsafe_allow_html=True)
+    try:
+        specs = build_compare_specs(models, cached_load)
+    except Exception as e:  # missing torch, bad checkpoint, ...
+        st.error(f"Could not load the trained agents: {e}")
+        return
+
+    cfg = ("compare", tuple(sp["label"] for sp in specs), max_pieces, deterministic)
+    if restart or st.session_state.get("cmp_cfg") != cfg or "cmp_slots" not in st.session_state:
+        st.session_state.cmp_cfg = cfg
+        st.session_state.cmp_slots, st.session_state.cmp_seed = new_compare_round(specs, max_pieces)
+        st.session_state.cmp_hist = {}
+        st.session_state.cmp_rng = np.random.default_rng()
+    slots = st.session_state.cmp_slots
+    history = st.session_state.cmp_hist
+    rng = st.session_state.cmp_rng
+    box = st.empty()
+
+    def show(views, header):
+        box.markdown(render_compare(slots, views, header, history), unsafe_allow_html=True)
+
+    def idle_header():
+        ref = next((s["env"] for s in slots if not s["done"]), slots[0]["env"])
+        return {"num": ref.pieces_placed + 1, "cur": ref.piece, "nxt": peek_next(ref)}
+
+    if not st.session_state.run:
+        show([dict(grid=s["env"].grid()) for s in slots], idle_header())
+        st.caption("Paused. Turn on 'Run simulation' in the sidebar.")
+        return
+
+    delay = 0.30 / speed
+    while True:  # a widget change in the sidebar stops this and reruns the script
+        if all(s["done"] for s in slots):
+            show([dict(grid=s["env"].grid()) for s in slots], idle_header())
+            time.sleep(2.5)
+            for s in slots:
+                history.setdefault(s["spec"]["label"], []).append((s["env"].pieces_placed, s["env"].total_lines))
+            st.session_state.cmp_slots, st.session_state.cmp_seed = new_compare_round(specs, max_pieces)
+            slots = st.session_state.cmp_slots
+            continue
+        compare_step(slots, show, delay, deterministic, rng)
+
 # ----------------------------------------------------------------------------
 # Streamlit app
 # ----------------------------------------------------------------------------
@@ -333,15 +598,21 @@ def main():
 
     st.session_state.setdefault("run", True)
     models = available_models()
-    agent_options = list(models) + SIMPLE_AGENTS
+    agent_options = list(models) + SIMPLE_AGENTS + [COMPARE]
     with st.sidebar:
         st.header("Demo controls")
         st.toggle("Run simulation", key="run")
         agent = st.radio("Agent", agent_options)
+        compare = agent == COMPARE
         is_trained = agent in models
         deterministic = True
         model = None
-        if is_trained:
+        if compare:
+            deterministic = st.toggle("Always pick the best move", value=True,
+                                      help="Applies to the trained agents. Off = sample from the policy.")
+            st.caption("All agents get the exact same piece sequence. Greedy and Random score with the default "
+                       "reward weights; trained agents use the weights they were trained with.")
+        elif is_trained:
             try:
                 model, trained_w, mi = cached_load(models[agent])
             except Exception as e:  # missing torch, bad checkpoint, ...
@@ -372,6 +643,10 @@ def main():
         restart = st.button("New game")
         if "Baseline PPO (trained)" not in models:
             st.caption("Baseline PPO appears here once models/baseline_s0_final.pt is added.")
+
+    if compare:
+        run_compare(st, models, max_pieces, speed, deterministic, restart)
+        return
 
     cfg = (agent, (weights.w1, weights.w2, weights.w3, weights.w4), max_pieces, deterministic)
     if restart or st.session_state.get("cfg") != cfg or "env" not in st.session_state:
