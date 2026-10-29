@@ -2,25 +2,74 @@
 tetris_demo.py - live demo of an agent playing Tetris in Streamlit.
 
 Run:  streamlit run tetris_demo.py
-Needs tetris_env.py and reward.py in the same folder (numpy + streamlit only, no torch).
+Needs tetris_env.py, reward.py and network.py in the same folder, plus torch for the trained agents.
+Trained checkpoints live in models/ (see MODELS below). Greedy and Random agents need no torch.
 
 What you see:
   - the next piece in the NEXT box, which then falls into the spot the agent chose
   - when a line is completed: it flashes, the row disappears, and the stack drops down
   - live stats (pieces, lines, reward, holes, height, bumpiness) and the last move's r1..r4
 
-The demo agent is Random or Greedy (picks the placement with the best immediate reward).
-Pick the reward weights in the sidebar to see how the reward changes the play style.
-A trained PPO agent can replace choose_action() later.
+Agents (pick in the sidebar):
+  - Multi-objective PPO   the trained agent (models/multi_s0_final.pt)
+  - Baseline PPO          lines-only agent; appears once its checkpoint is in models/
+  - Greedy / Random       simple reference agents (these use the reward weights from the sidebar)
+Trained agents play with the reward weights they were trained with (read from the checkpoint).
 """
 
 import copy
+import os
 import time
 
 import numpy as np
 
 from reward import RewardWeights, baseline_weights, board_features, compute_reward
 from tetris_env import PIECE_NAMES, ROTATIONS, TetrisPlacementEnv
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Trained agents: sidebar label -> checkpoint path (relative to this file).
+# To add the baseline: copy its final.pt to models/baseline_s0_final.pt, nothing else to change.
+MODELS = {
+    "Multi-objective PPO (trained)": "models/multi_s0_final.pt",
+    "Baseline PPO (trained)": "models/baseline_s0_final.pt",
+}
+SIMPLE_AGENTS = ["Greedy (best immediate reward)", "Random"]
+
+
+def available_models() -> dict:
+    """Only the trained agents whose checkpoint file actually exists."""
+    return {k: v for k, v in MODELS.items() if os.path.exists(os.path.join(HERE, v))}
+
+
+def load_agent(rel_path: str):
+    """Load a trained checkpoint. Returns (model in eval mode, reward weights tuple (w1..w4), info dict)."""
+    import torch
+
+    from network import ARCH, TetrisActorCritic
+
+    ckpt = torch.load(os.path.join(HERE, rel_path), map_location="cpu", weights_only=False)
+    if ckpt.get("arch") != ARCH:
+        raise ValueError(f"{rel_path} was saved by a different network design (arch={ckpt.get('arch')!r}).")
+    model = TetrisActorCritic()
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    cfg = ckpt.get("config", {})
+    weights = tuple(cfg.get("weights", (1.0, 0.5, 0.2, 0.1)))
+    info = {"iteration": ckpt.get("iteration"), "total_steps": ckpt.get("total_steps"), "seed": cfg.get("seed")}
+    return model, weights, info
+
+
+def trained_action(model, state, mask, deterministic: bool) -> int:
+    """Ask the trained network for a placement (illegal ones are masked inside the network)."""
+    import torch
+
+    from network import to_tensors
+
+    with torch.no_grad():
+        action, _, _ = model.act(to_tensors(state, mask), deterministic=deterministic)
+    return int(action)
+
 
 # board id 1..7 = I, O, T, S, Z, J, L  ->  (light, dark) gradient colors
 PIECE_COLORS = {
@@ -115,7 +164,8 @@ def play_one_piece(env, action, show, delay, last_prev=None):
     """
     Animate one placement and apply it to the env.
     show(grid, overlay=None, flash_rows=(), flash_on=True, blank_rows=(), phase="fall", last=None)
-    draws one frame. Returns (last_move_info, done).
+    draws one frame. Returns (last_move_info, done, info, state, mask) where state/mask are the
+    observation after the move (needed by the trained agent for the next decision).
     """
     rot, col = divmod(int(action), env.cols)
     shape = ROTATIONS[env.piece][rot]
@@ -130,7 +180,7 @@ def play_one_piece(env, action, show, delay, last_prev=None):
         time.sleep(delay)
 
     # 2) apply the move in the env (this is the real game step)
-    _, reward, done, info, _ = env.step(action)
+    state, reward, done, info, mask = env.step(action)
     last = {"piece": info["piece"], "components": info["reward_components"], "total": reward}
 
     # 3) line clear: flash, remove the rows, then the stack drops
@@ -143,7 +193,7 @@ def play_one_piece(env, action, show, delay, last_prev=None):
 
     show(env.grid(), phase="landed", last=last)
     time.sleep(delay)
-    return last, done
+    return last, done, info, state, mask
 
 
 # ----------------------------------------------------------------------------
@@ -257,6 +307,17 @@ def render_scene(env, grid, history, last, phase="fall", banner=None, **board_kw
 # ----------------------------------------------------------------------------
 # Streamlit app
 # ----------------------------------------------------------------------------
+def cached_load(rel_path: str):
+    """Load a checkpoint once per server process, not on every Streamlit rerun."""
+    import streamlit as st
+
+    @st.cache_resource(show_spinner="Loading trained agent...")
+    def _load(p):
+        return load_agent(p)
+
+    return _load(rel_path)
+
+
 def main():
     import streamlit as st
 
@@ -271,30 +332,52 @@ def main():
     )
 
     st.session_state.setdefault("run", True)
+    models = available_models()
+    agent_options = list(models) + SIMPLE_AGENTS
     with st.sidebar:
         st.header("Demo controls")
         st.toggle("Run simulation", key="run")
-        agent = st.radio("Agent", ["Greedy (best immediate reward)", "Random"])
-        preset = st.radio("Reward", ["Baseline (R = r1)", "Multi-objective (default)", "Custom"])
-        if preset.startswith("Baseline"):
-            weights = baseline_weights()
-        elif preset.startswith("Multi"):
-            weights = RewardWeights()
-        else:
-            weights = RewardWeights(
-                w1=st.slider("w1 line clears", 0.0, 5.0, 1.0, 0.1),
-                w2=st.slider("w2 new holes", 0.0, 3.0, 0.5, 0.1),
-                w3=st.slider("w3 height / bumpiness", 0.0, 3.0, 0.2, 0.1),
-                w4=st.slider("w4 survival", 0.0, 2.0, 0.1, 0.05),
+        agent = st.radio("Agent", agent_options)
+        is_trained = agent in models
+        deterministic = True
+        model = None
+        if is_trained:
+            try:
+                model, trained_w, mi = cached_load(models[agent])
+            except Exception as e:  # missing torch, bad checkpoint, ...
+                st.error(f"Could not load {agent}: {e}")
+                return
+            weights = RewardWeights(*trained_w)
+            deterministic = st.toggle("Always pick the best move", value=True,
+                                      help="Off = sample from the policy, like during training.")
+            st.caption(
+                f"Reward it was trained with: w1={weights.w1}, w2={weights.w2}, w3={weights.w3}, "
+                f"w4={weights.w4} · {mi['total_steps']:,} training steps"
             )
+        else:
+            preset = st.radio("Reward", ["Baseline (R = r1)", "Multi-objective (default)", "Custom"])
+            if preset.startswith("Baseline"):
+                weights = baseline_weights()
+            elif preset.startswith("Multi"):
+                weights = RewardWeights()
+            else:
+                weights = RewardWeights(
+                    w1=st.slider("w1 line clears", 0.0, 5.0, 1.0, 0.1),
+                    w2=st.slider("w2 new holes", 0.0, 3.0, 0.5, 0.1),
+                    w3=st.slider("w3 height / bumpiness", 0.0, 3.0, 0.2, 0.1),
+                    w4=st.slider("w4 survival", 0.0, 2.0, 0.1, 0.05),
+                )
+        max_pieces = st.select_slider("Pieces per game (0 = until game over)", [0, 100, 250, 500, 1000], value=500)
         speed = st.slider("Speed", 1, 10, 5)
         restart = st.button("New game")
+        if "Baseline PPO (trained)" not in models:
+            st.caption("Baseline PPO appears here once models/baseline_s0_final.pt is added.")
 
-    cfg = (agent, (weights.w1, weights.w2, weights.w3, weights.w4))
+    cfg = (agent, (weights.w1, weights.w2, weights.w3, weights.w4), max_pieces, deterministic)
     if restart or st.session_state.get("cfg") != cfg or "env" not in st.session_state:
         st.session_state.cfg = cfg
-        env = TetrisPlacementEnv(weights=weights)
-        env.reset()
+        env = TetrisPlacementEnv(weights=weights, max_pieces=max_pieces or None)
+        st.session_state.obs = env.reset()  # (state, mask)
         st.session_state.env = env
         st.session_state.history = []
         st.session_state.last = None
@@ -315,17 +398,22 @@ def main():
 
     delay = 0.30 / speed
     while True:  # a widget change in the sidebar stops this and reruns the script
-        if agent.startswith("Greedy"):
+        state, mask = st.session_state.obs
+        if is_trained:
+            action = trained_action(model, state, mask, deterministic)
+        elif agent.startswith("Greedy"):
             action = greedy_action(env, env.weights, rng)
         else:
             action = int(rng.choice(np.flatnonzero(env.mask)))
-        last, done = play_one_piece(env, action, show, delay, st.session_state.last)
+        last, done, info, state, mask = play_one_piece(env, action, show, delay, st.session_state.last)
+        st.session_state.obs = (state, mask)
         st.session_state.last = last
         if done:
-            show(env.grid(), phase="landed", banner="GAME OVER", last=last)
+            died = bool(info.get("terminated", True))
+            show(env.grid(), phase="landed", banner="GAME OVER" if died else "LIMIT REACHED", last=last)
             time.sleep(1.5)
             st.session_state.history.append((env.pieces_placed, env.total_lines))
-            env.reset()
+            st.session_state.obs = env.reset()
             st.session_state.last = None
 
 
